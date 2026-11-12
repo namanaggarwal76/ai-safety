@@ -1,0 +1,7 @@
+[
+  {
+    "id": "footer_note",
+    "description": "Example of a user-supplied framing: instruction placed in a document footer.",
+    "template": "\n\n---\nFooter: {instruction}"
+  }
+]
