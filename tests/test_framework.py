@@ -19,7 +19,8 @@ from injectbench.techniques import BUILTIN, load_techniques
 
 
 def test_self_check_passes_on_all_cases():
-    assert self_check(build_cases()) == []
+    # every technique, every position each point supports, and per-case secrets
+    assert self_check() == []
 
 
 def test_every_channel_is_covered():

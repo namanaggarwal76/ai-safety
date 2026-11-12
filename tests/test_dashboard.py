@@ -83,6 +83,9 @@ def test_demo_job_runs_and_saves(server, tmp_path):
     assert runs and runs[0]["targets"] == ["reference:mixed-demo"]
     loaded = call(base, f"/api/runs/{runs[0]['name']}")
     assert len(loaded["records"]) == job["total"]
+    saved = json.loads((tmp_path / runs[0]["name"] / "dashboard.json").read_text())
+    assert saved["provenance"]["seed"] == saved["plan"]["seed"] and saved["provenance"]["scenarios_sha"]
+    assert detail["scenario_info"]["canary"] == detail["canary"] != "IBK-SECRET-4F9A2C"
 
 
 def test_job_without_key_fails_fast(server, monkeypatch):
