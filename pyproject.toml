@@ -9,7 +9,13 @@ description = "Framework for testing whether AI agents resist malicious instruct
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-dependencies = ["anthropic>=1.0", "pytest>=8"]
+# the OpenAI-compatible providers need nothing beyond the standard library
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=1.0"]
+dev = ["pytest>=8"]
+all = ["anthropic>=1.0", "pytest>=8"]
 
 [project.scripts]
 injectbench = "injectbench.__main__:main"

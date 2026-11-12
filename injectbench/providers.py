@@ -68,6 +68,15 @@ PROVIDERS: dict[str, Provider] = {p.id: p for p in [
 ]}
 
 
+def anthropic_module():
+    """The anthropic SDK, which is an optional dependency."""
+    try:
+        import anthropic
+    except ImportError:
+        raise RuntimeError("the anthropic package is missing: pip install 'injectbench[anthropic]'") from None
+    return anthropic
+
+
 def env_key(provider_id: str) -> Optional[str]:
     p = PROVIDERS[provider_id]
     return os.environ.get(p.env_var) if p.env_var else None
@@ -75,7 +84,8 @@ def env_key(provider_id: str) -> Optional[str]:
 
 def build_agent(provider_id: str, model: str, api_key: Optional[str] = None,
                 base_url: Optional[str] = None, max_turns: int = 12,
-                fallbacks: Optional[bool] = None, effort: Optional[str] = None) -> Agent:
+                fallbacks: Optional[bool] = None, effort: Optional[str] = None,
+                temperature: Optional[float] = None) -> Agent:
     p = PROVIDERS[provider_id]
     if p.kind == "reference":
         from .agents.scripted import DemoAgent
@@ -88,10 +98,10 @@ def build_agent(provider_id: str, model: str, api_key: Optional[str] = None,
     if p.kind == "anthropic":
         from .agents.claude import ClaudeAgent
         return ClaudeAgent(model=model, max_turns=max_turns, fallbacks=fallbacks, effort=effort,
-                           api_key=key, base_url=base_url)
+                           temperature=temperature, api_key=key, base_url=base_url)
     return OpenAICompatAgent(model=model, base_url=base_url or p.base_url, api_key=key, provider=p.id,
                              max_turns=max_turns, max_tokens_param=p.max_tokens_param,
-                             extra_headers=p.extra_headers)
+                             extra_headers=p.extra_headers, temperature=temperature)
 
 
 # Name fragments of models that can't hold a chat with tools: embeddings, speech, images,
@@ -136,7 +146,7 @@ def list_models(provider_id: str, api_key: Optional[str] = None, base_url: Optio
         return list(p.models)
     key = api_key or env_key(provider_id)
     if p.kind == "anthropic":
-        import anthropic
+        anthropic = anthropic_module()
         kwargs = {k: v for k, v in (("api_key", key), ("base_url", base_url)) if v}
         client = anthropic.Anthropic(**kwargs)
         return sorted(m.id for m in client.models.list())
@@ -188,7 +198,7 @@ def probe_model(provider_id: str, model: str, api_key: Optional[str] = None,
     try:
         if p.kind == "anthropic":
             from .agents.claude import anthropic_error
-            import anthropic
+            anthropic = anthropic_module()
             kwargs = {k: v for k, v in (("api_key", key), ("base_url", base_url)) if v}
             try:
                 anthropic.Anthropic(**kwargs).models.retrieve(model)
