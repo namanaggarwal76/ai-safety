@@ -30,9 +30,7 @@ From the page you can paste keys for Anthropic, OpenAI, Google Gemini, Mistral, 
 DeepSeek, Groq, Together, Fireworks and OpenRouter, or point it at Ollama or another
 OpenAI-compatible server. Keys already set as environment variables are picked up, and
 "Test key" lists the chat models a key can use. Each model you add gets one small test
-request, so retired models, models without tool support and rate limits show up before a run. Pick up to eight models, choose the scenarios,
-goals, techniques and defenses, and the page shows how many agent runs that comes to before
-you start.
+request, so retired models, models without tool support and rate limits show up before a run. Pick up to eight models, choose the scenarios, goals, techniques and defenses, and the page shows how many agent runs that comes to before you start.
 
 While a run is going you get per-model attack success, outcome bars, a breakdown by data
 source or goal, a heatmap of injection point against goal, one square per run, and a feed
