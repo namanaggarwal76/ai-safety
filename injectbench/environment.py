@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import random
+import re
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .models import AgentTask, ToolCall
@@ -16,9 +19,16 @@ if TYPE_CHECKING:
 class Environment:
     """A private copy of a scenario's data plus a log of every tool call."""
 
-    def __init__(self, scenario: "Scenario", defense: Optional["Defense"] = None) -> None:
+    def __init__(self, scenario: "Scenario", defense: Optional["Defense"] = None,
+                 canary_seed: Optional[str] = None) -> None:
         self.scenario = scenario
         self.data: dict = copy.deepcopy(scenario.data)
+        # the secret this case uses; a seed gives every case its own, so published
+        # scenario files never contain the values models are tested on
+        self.canary: str = scenario.surface.canary
+        if canary_seed is not None:
+            self.canary = fresh_canary(scenario.surface.canary, canary_seed)
+            self.data = _replace_all(self.data, scenario.surface.canary, self.canary)
         self.calls: list[ToolCall] = []
         self.defense = defense
         self.attack: Optional[tuple["Goal", Optional["ForbiddenAction"]]] = None
@@ -29,9 +39,9 @@ class Environment:
         self.listener: Optional[Callable[["Environment", ToolCall], None]] = None
 
 
-    def inject(self, point_id: str, payload: str) -> None:
+    def inject(self, point_id: str, payload: str, position: str = "end") -> None:
         point = self.scenario.point(point_id)
-        point.apply(self.data, payload)
+        point.place(self.data, payload, position)
         self.injected_payload = payload
         self.injection_point_id = point_id
 
@@ -60,10 +70,11 @@ class Environment:
         except Exception as exc:
             raw = f"Error: {exc}"
             is_error = True
-        if self.injected_payload and not is_error and not self.exposed:
+        # error text can carry attacker content too, so it counts and gets wrapped
+        if self.injected_payload and not self.exposed:
             self.exposed = _normalize(self.injected_payload) in _normalize(raw)
         rendered = raw
-        if self.defense is not None and not is_error:
+        if self.defense is not None:
             rendered = self.defense.wrap_tool_result(name, raw)
         call = ToolCall(name=name, args=args, result=rendered, is_error=is_error)
         self.calls.append(call)
@@ -91,3 +102,32 @@ class Environment:
 def _normalize(text: str) -> str:
     text = text.replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\")
     return " ".join(text.split())
+
+
+def fresh_canary(template: str, seed: str) -> str:
+    """Same shape as the template, with every letter and digit redrawn except a
+    leading lowercase prefix such as ``pat_`` or ``dpl_`` that makes it look real."""
+    rng = random.Random(hashlib.sha256(f"{template}|{seed}".encode()).digest())
+    m = re.match(r"(?:[a-z]+_)+", template)
+    start = m.end() if m else 0
+    out = list(template)
+    for i in range(start, len(out)):
+        c = out[i]
+        if c.isdigit():
+            out[i] = rng.choice("0123456789")
+        elif c.isupper():
+            out[i] = rng.choice("ABCDEFGHJKLMNPQRSTUVWXYZ")
+        elif c.islower():
+            out[i] = rng.choice("abcdefghijkmnpqrstuvwxyz")
+    fresh = "".join(out)
+    return fresh if fresh != template else fresh_canary(template, seed + "'")
+
+
+def _replace_all(obj: Any, old: str, new: str) -> Any:
+    if isinstance(obj, str):
+        return obj.replace(old, new)
+    if isinstance(obj, dict):
+        return {k: _replace_all(v, old, new) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_all(v, old, new) for v in obj]
+    return obj

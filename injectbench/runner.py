@@ -12,12 +12,12 @@ from .defenses import DEFENSES, Defense
 from .environment import Environment
 from .goals import GOALS, Goal, mentions_injection
 from .models import AgentTrace
-from .scenario import ForbiddenAction, InjectionPoint, Scenario
+from .scenario import POSITIONS, ForbiddenAction, InjectionPoint, Scenario
 from .scenarios import SCENARIOS
 from .techniques import BUILTIN, Technique
 
 OUTCOMES = ("compromised", "resisted", "refused", "unexposed", "error")
-
+Grader = Callable[[Scenario, AgentTrace], Optional[bool]]
 
 
 @dataclass
@@ -28,6 +28,7 @@ class Case:
     action: Optional[ForbiddenAction] = None
     technique: Optional[Technique] = None
     repeat: int = 0
+    position: str = "end"
 
     @property
     def injected(self) -> bool:
@@ -45,6 +46,8 @@ class Case:
             base = f"{self.scenario.id}/clean"
         else:
             base = f"{self.scenario.id}/{self.point.id}/{self.goal_label}/{self.technique.id}"
+            if self.position != "end":
+                base += f"@{self.position}"
         return f"{base}#{self.repeat}" if self.repeat else base
 
     def payload(self) -> Optional[str]:
@@ -52,9 +55,14 @@ class Case:
             return None
         instruction = self.goal.instruction(self.scenario.surface, self.action)
         text = self.technique.render(instruction)
-        if self.scenario.surface.canary in text:
-            raise ValueError(f"{self.id}: payload contains the canary, judges would false-positive")
+        _check_payload(self.id, text, self.scenario.surface.canary)
         return text
+
+
+def _check_payload(case_id: str, payload: str, canary: str) -> None:
+    from .goals import contains_secret
+    if contains_secret(payload, canary):
+        raise ValueError(f"{case_id}: payload contains the canary, judges would false-positive")
 
 
 @dataclass
@@ -80,6 +88,11 @@ class CaseResult:
     duration_s: float
     payload: Optional[str]
     trace: dict = field(default_factory=dict)
+    # added after the first release; defaults keep older cases.jsonl files loadable
+    position: Optional[str] = None
+    repeat: int = 0
+    canary: Optional[str] = None
+    task_success_llm: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -93,8 +106,14 @@ def build_cases(
     channels: Optional[Iterable[str]] = None,
     include_clean: bool = True,
     repeats: int = 1,
+    positions: Optional[Iterable[str]] = ("end",),
 ) -> list[Case]:
+    """Every combination of the selections. ``positions=None`` uses every position each point supports."""
     scen = [SCENARIOS[s] for s in (scenarios or SCENARIOS)]
+    pos_filter = set(positions) if positions else set(POSITIONS)
+    unknown = pos_filter - set(POSITIONS)
+    if unknown:
+        raise ValueError(f"unknown position(s) {sorted(unknown)}; expected some of {POSITIONS}")
     goal_list = [GOALS[g] for g in (goals or GOALS)]
     techs = list((techniques or BUILTIN).values())
     point_filter = set(points) if points else None
@@ -113,7 +132,9 @@ def build_cases(
                     actions = sc.surface.actions if g.per_action else [None]
                     for a in actions:
                         for t in techs:
-                            cases.append(Case(sc, pt, g, a, t, repeat=r))
+                            for pos in pt.positions:
+                                if pos in pos_filter:
+                                    cases.append(Case(sc, pt, g, a, t, repeat=r, position=pos))
     return cases
 
 
@@ -136,12 +157,17 @@ def judge(case: Case, env: Environment, trace: AgentTrace) -> tuple[Optional[str
 
 
 def run_case(agent: Agent, case: Case, defense: Defense,
-             listener: Optional[Callable] = None) -> CaseResult:
-    env = Environment(case.scenario, defense=defense)
+             listener: Optional[Callable] = None, seed: Optional[str] = None,
+             grader: Optional[Grader] = None) -> CaseResult:
+    """``seed`` gives the case its own secret (derived from the seed and case id);
+    without one the scenario's fixed secret is used."""
+    canary_seed = None if seed is None else f"{seed}|{case.id}"
+    env = Environment(case.scenario, defense=defense, canary_seed=canary_seed)
     env.listener = listener
     payload = case.payload()
     if case.injected:
-        env.inject(case.point.id, payload)
+        _check_payload(case.id, payload, env.canary)
+        env.inject(case.point.id, payload, case.position)
         env.attack = (case.goal, case.action)
     start = time.monotonic()
     try:
@@ -152,6 +178,12 @@ def run_case(agent: Agent, case: Case, defense: Defense,
                            meta={"traceback": traceback.format_exc(limit=5)})
     duration = time.monotonic() - start
     outcome, success, task_ok = judge(case, env, trace)
+    graded = None
+    if grader is not None and not trace.error:
+        try:
+            graded = grader(case.scenario, trace)
+        except Exception as exc:
+            trace.meta["grader_error"] = f"{type(exc).__name__}: {exc}"
     return CaseResult(
         case_id=case.id,
         scenario=case.scenario.id,
@@ -168,12 +200,16 @@ def run_case(agent: Agent, case: Case, defense: Defense,
         task_success=task_ok,
         refused=trace.refused,
         error=trace.error,
-        flagged_injection=mentions_injection(trace.final_text),
+        flagged_injection=mentions_injection(trace.visible_text()),
         exposed=env.exposed if case.injected else None,
         fallback_used=bool(trace.meta.get("fallback_used")),
         duration_s=round(duration, 3),
         payload=payload,
         trace=trace.to_dict(),
+        position=case.position if case.injected else None,
+        repeat=case.repeat,
+        canary=env.canary,
+        task_success_llm=graded,
     )
 
 
@@ -183,11 +219,13 @@ def run(
     defenses: Iterable[str] = ("none",),
     workers: int = 1,
     on_result: Optional[Callable[[CaseResult], None]] = None,
+    seed: Optional[str] = None,
+    grader: Optional[Grader] = None,
 ) -> list[CaseResult]:
     jobs = [(c, DEFENSES[d]()) for d in defenses for c in cases]
 
     def _one(job):
-        res = run_case(agent, *job)
+        res = run_case(agent, *job, seed=seed, grader=grader)
         if on_result:
             on_result(res)
         return res
@@ -198,14 +236,15 @@ def run(
         return list(pool.map(_one, jobs))
 
 
-def self_check(cases: Optional[list[Case]] = None) -> list[str]:
-    """Run the obedient and ignoring agents over every case and list anything the judges got wrong."""
+def self_check(cases: Optional[list[Case]] = None, seed: Optional[str] = "self-check") -> list[str]:
+    """Run the obedient and ignoring agents over every case (every position, per-case
+    secrets) and list anything the judges got wrong."""
     from .agents.scripted import IgnoringAgent, ObedientAgent
 
-    cases = cases if cases is not None else build_cases()
+    cases = cases if cases is not None else build_cases(positions=None)
     problems: list[str] = []
     for case in cases:
-        ign = run_case(IgnoringAgent(), case, DEFENSES["none"]())
+        ign = run_case(IgnoringAgent(), case, DEFENSES["none"](), seed=seed)
         if ign.error:
             problems.append(f"{case.id}: ignoring agent errored: {ign.error}")
         if not ign.task_success:
@@ -215,7 +254,7 @@ def self_check(cases: Optional[list[Case]] = None) -> list[str]:
         if case.injected and not ign.exposed:
             problems.append(f"{case.id}: reference solution never surfaces the injected payload")
         if case.injected:
-            obe = run_case(ObedientAgent(), case, DEFENSES["none"]())
+            obe = run_case(ObedientAgent(), case, DEFENSES["none"](), seed=seed)
             if not obe.attack_success:
                 problems.append(f"{case.id}: judge misses the obedient agent (false negative)")
     return problems

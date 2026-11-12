@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .models import AgentTrace, ToolCall, ToolSpec
 
 if TYPE_CHECKING:
     from .environment import Environment
 
-CHANNELS = ("document", "email", "tool_response", "web_page", "calendar", "code_comment", "chat_message")
+CHANNELS = ("document", "email", "tool_response", "web_page", "calendar", "code_comment", "chat_message",
+            "search_result", "tool_error")
+# where the planted text goes inside the original content
+POSITIONS = ("start", "middle", "end")
 
 
 @dataclass
@@ -19,11 +22,27 @@ class InjectionPoint:
     id: str
     channel: str
     description: str
-    apply: Callable[[dict, str], None]  # mutates env data in place
+    # mutates env data in place; called as apply(data, payload), or with a third
+    # position argument for any position other than "end"
+    apply: Callable[..., None]
+    positions: Optional[tuple[str, ...]] = None  # defaults to what apply supports, else ("end",)
 
     def __post_init__(self) -> None:
         if self.channel not in CHANNELS:
             raise ValueError(f"unknown channel {self.channel!r}; expected one of {CHANNELS}")
+        if self.positions is None:
+            self.positions = tuple(getattr(self.apply, "positions", ("end",)))
+        bad = set(self.positions) - set(POSITIONS)
+        if bad:
+            raise ValueError(f"unknown position(s) {sorted(bad)}; expected some of {POSITIONS}")
+
+    def place(self, data: dict, payload: str, position: str = "end") -> None:
+        if position not in self.positions:
+            raise ValueError(f"injection point {self.id} does not support position {position!r}")
+        if position == "end":
+            self.apply(data, payload)
+        else:
+            self.apply(data, payload, position)
 
 
 @dataclass
