@@ -6,6 +6,7 @@ import re
 import socket
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -79,7 +80,7 @@ def _wait_for_cooldown(key: str) -> None:
 
 def http_json(method: str, url: str, api_key: Optional[str], body: Optional[dict] = None,
               headers: Optional[dict] = None, timeout: float = 300, retries: int = 3,
-              rate_limit_retries: int = 6) -> dict:
+              rate_limit_retries: int = 20) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     hdrs = {"Content-Type": "application/json", "Accept": "application/json",
             "User-Agent": "injectbench/0.1"}
@@ -128,6 +129,13 @@ def _text(content: Any) -> str:
     return str(content)
 
 
+# Some providers (Groq, for one) validate the model's tool calls and answer 400 when the
+# model invents a tool or leaves out a required argument. That is the model sampling a bad
+# call, not a bad request, so the request is sent again for a fresh sample.
+_BAD_TOOL_CALL = re.compile(r"tool call validation failed|tool_use_failed|failed_generation|"
+                            r"failed to (?:call|parse) (?:a )?(?:function|tool)", re.I)
+BAD_TOOL_CALL_RETRIES = 3
+
 # Message fields that only matter on output and can be dropped when sending a message back.
 _OUTPUT_ONLY = {"refusal", "annotations", "audio", "function_call"}
 _CORE = {"role", "content", "tool_calls"}
@@ -155,7 +163,8 @@ class OpenAICompatAgent(Agent):
         extra_headers: Optional[dict] = None,
         timeout: float = 300,
         transport: Any = None,
-        rate_limit_retries: int = 6,
+        rate_limit_retries: int = 20,
+        temperature: Optional[float] = None,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -168,22 +177,35 @@ class OpenAICompatAgent(Agent):
         self.timeout = timeout
         self.transport = transport or (
             lambda *a: http_json(*a, rate_limit_retries=rate_limit_retries))
+        self.temperature = temperature
         self.dropped_fields: set[str] = set()
+        self.send_temperature = temperature is not None
+        # one agent serves every worker thread; the request fixes it learns are shared
+        self._lock = threading.Lock()
         self.name = f"{provider}:{model}"
 
     def describe(self) -> dict:
         return {"name": self.name, "provider": self.provider, "model": self.model,
-                "base_url": self.base_url, "max_turns": self.max_turns}
+                "base_url": self.base_url, "max_turns": self.max_turns, "temperature": self.temperature}
 
     def _outgoing(self, messages: list[dict]) -> list[dict]:
-        if not self.dropped_fields:
+        dropped = set(self.dropped_fields)
+        if not dropped:
             return messages
-        return [{k: v for k, v in m.items() if k not in self.dropped_fields} if m.get("role") == "assistant" else m
+        return [{k: v for k, v in m.items() if k not in dropped} if m.get("role") == "assistant" else m
                 for m in messages]
 
     def _adapt(self, error: str, messages: list[dict], max_tokens: int) -> Optional[int]:
         """Change the request so the provider accepts it. Returns the new max_tokens, or None."""
+        with self._lock:
+            return self._adapt_locked(error, messages, max_tokens)
+
+    def _adapt_locked(self, error: str, messages: list[dict], max_tokens: int) -> Optional[int]:
         low = error.lower()
+        if self.send_temperature and "temperature" in low:
+            # reasoning models only take their default temperature
+            self.send_temperature = False
+            return max_tokens
         extra = {k for m in messages if m.get("role") == "assistant" for k in m} - _CORE - self.dropped_fields
         for field in sorted(extra):
             if re.search(rf"\b{re.escape(field.lower())}\b", low):
@@ -203,8 +225,12 @@ class OpenAICompatAgent(Agent):
                  max_tokens: Optional[int] = None) -> dict:
         """One chat-completions request, adjusted and retried on fixable 400s."""
         limit = max_tokens or self.max_tokens
-        for _ in range(6):
-            body: dict = {"model": self.model, "messages": self._outgoing(messages), self.max_tokens_param: limit}
+        resamples = adjustments = 0
+        while True:
+            with self._lock:
+                body: dict = {"model": self.model, "messages": self._outgoing(messages), self.max_tokens_param: limit}
+                if self.send_temperature:
+                    body["temperature"] = self.temperature
             if tools:
                 body["tools"] = tools
             try:
@@ -213,13 +239,22 @@ class OpenAICompatAgent(Agent):
             except ProviderError as exc:
                 if exc.status not in (400, 422):
                     raise
+                if _BAD_TOOL_CALL.search(str(exc)):
+                    if resamples < BAD_TOOL_CALL_RETRIES:
+                        resamples += 1
+                        continue
+                    raise ProviderError(f"model kept producing invalid tool calls ({resamples + 1} tries): {exc}",
+                                        exc.status) from None
+                if adjustments >= 6:
+                    raise ProviderError(f"{self.name}: request still rejected after adjusting it") from None
+                adjustments += 1
                 new_limit = self._adapt(str(exc), messages, limit)
                 if new_limit is None:
                     raise
                 if max_tokens is None and new_limit != limit:
-                    self.max_tokens = new_limit
+                    with self._lock:
+                        self.max_tokens = min(self.max_tokens, new_limit)
                 limit = new_limit
-        raise ProviderError(f"{self.name}: request still rejected after adjusting it")
 
     def run(self, env: Environment) -> AgentTrace:
         task = env.task()
@@ -235,63 +270,68 @@ class OpenAICompatAgent(Agent):
         shown: list[str] = []
         last_text = ""
 
-        for turn in range(1, self.max_turns + 1):
-            trace.turns = turn
-            data = self.complete(messages, tools)
-            u = data.get("usage") or {}
-            usage["input_tokens"] += u.get("prompt_tokens", 0) or 0
-            usage["output_tokens"] += u.get("completion_tokens", 0) or 0
-            if data.get("model"):
-                served_by.add(data["model"])
-            choices = data.get("choices") or []
-            if not choices:
-                trace.error = f"no choices in response: {json.dumps(data)[:300]}"
-                break
-            choice = choices[0]
-            msg = choice.get("message") or {}
-            finish = choice.get("finish_reason")
+        try:
+            for turn in range(1, self.max_turns + 1):
+                trace.turns = turn
+                data = self.complete(messages, tools)
+                u = data.get("usage") or {}
+                usage["input_tokens"] += u.get("prompt_tokens", 0) or 0
+                usage["output_tokens"] += u.get("completion_tokens", 0) or 0
+                if data.get("model"):
+                    served_by.add(data["model"])
+                choices = data.get("choices") or []
+                if not choices:
+                    trace.error = f"no choices in response: {json.dumps(data)[:300]}"
+                    break
+                choice = choices[0]
+                msg = choice.get("message") or {}
+                finish = choice.get("finish_reason")
 
-            if msg.get("refusal") or finish == "content_filter":
-                trace.refused = True
-                trace.meta["refusal_category"] = msg.get("refusal") or finish
-                break
+                if msg.get("refusal") or finish == "content_filter":
+                    trace.refused = True
+                    trace.meta["refusal_category"] = msg.get("refusal") or finish
+                    break
 
-            text = _text(msg.get("content"))
-            if text:
-                last_text = text
-                shown.append(text)
-            tool_calls = msg.get("tool_calls") or []
-            assistant = {k: v for k, v in msg.items()
-                         if v is not None and v != [] and k not in _OUTPUT_ONLY}
-            assistant["role"] = "assistant"
-            assistant["content"] = text
-            if tool_calls:
-                for tc in tool_calls:
-                    tc.setdefault("id", f"call_{uuid.uuid4().hex[:12]}")
-                assistant["tool_calls"] = [
-                    {**tc, "type": tc.get("type") or "function",
-                     "function": {**tc["function"], "arguments": tc["function"].get("arguments") or "{}"}}
-                    for tc in tool_calls
-                ]
-            messages.append(assistant)
+                text = _text(msg.get("content"))
+                if text:
+                    last_text = text
+                    shown.append(text)
+                tool_calls = msg.get("tool_calls") or []
+                assistant = {k: v for k, v in msg.items()
+                             if v is not None and v != [] and k not in _OUTPUT_ONLY}
+                assistant["role"] = "assistant"
+                assistant["content"] = text
+                if tool_calls:
+                    for tc in tool_calls:
+                        tc.setdefault("id", f"call_{uuid.uuid4().hex[:12]}")
+                    assistant["tool_calls"] = [
+                        {**tc, "type": tc.get("type") or "function",
+                         "function": {**tc["function"], "arguments": tc["function"].get("arguments") or "{}"}}
+                        for tc in tool_calls
+                    ]
+                messages.append(assistant)
 
-            if finish == "length" and not tool_calls:
-                trace.error = "max_tokens reached"
-                break
-            if not tool_calls:
-                break
-            for tc in assistant["tool_calls"]:
-                raw = tc["function"]["arguments"]
-                try:
-                    args = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                    if not isinstance(args, dict):
-                        args = {"value": args}
-                except ValueError:
-                    args = {"raw": raw}
-                call = env.call_tool(tc["function"]["name"], args)
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": call.result})
-        else:
-            trace.error = f"max_turns ({self.max_turns}) reached"
+                if finish == "length" and not tool_calls:
+                    trace.error = "max_tokens reached"
+                    break
+                if not tool_calls:
+                    break
+                for tc in assistant["tool_calls"]:
+                    raw = tc["function"]["arguments"]
+                    try:
+                        args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                        if not isinstance(args, dict):
+                            args = {"value": args}
+                    except ValueError:
+                        args = {"raw": raw}
+                    call = env.call_tool(tc["function"]["name"], args)
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": call.result})
+            else:
+                trace.error = f"max_turns ({self.max_turns}) reached"
+        except Exception as exc:
+            # keep what the model said and did before the failure
+            trace.error = f"{type(exc).__name__}: {exc}"
+            trace.meta["traceback"] = traceback.format_exc(limit=5)
 
         trace.final_text = last_text
         trace.transcript_text = "\n\n".join(shown)
