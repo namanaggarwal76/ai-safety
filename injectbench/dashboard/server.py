@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,14 +23,18 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..defenses import DEFENSES
 from ..goals import GOALS
 from ..providers import PROVIDERS, build_agent, env_key, list_models, probe_model
+from ..provenance import provenance
 from ..report import write_outputs
 from ..runner import Case, CaseResult, build_cases, run_case
-from ..scenario import CHANNELS
+from ..scenario import CHANNELS, POSITIONS
 from ..scenarios import SCENARIOS
 from ..techniques import BUILTIN, load_techniques
 
 STATIC = Path(__file__).parent / "static"
 MAX_RUNS = 20000  # per job
+MAX_TURNS = 40
+KEEP_FINISHED_JOBS = 5  # older finished jobs are dropped from memory; their results stay on disk
+RUN_CACHE_SIZE = 4
 
 
 def _mask(key: str) -> str:
@@ -45,7 +50,8 @@ def light(r: CaseResult, key: str, target: int) -> dict:
     return {
         "key": key, "target": target, "case_id": r.case_id, "scenario": r.scenario,
         "channel": r.channel, "injection_point": r.injection_point, "goal": r.goal,
-        "goal_category": r.goal_category, "technique": r.technique, "defense": r.defense,
+        "goal_category": r.goal_category, "technique": r.technique, "position": r.position,
+        "defense": r.defense,
         "agent": r.agent, "injected": r.injected, "outcome": r.outcome,
         "attack_success": r.attack_success, "task_success": r.task_success, "refused": r.refused,
         "error": r.error, "exposed": r.exposed, "flagged": r.flagged_injection,
@@ -61,7 +67,8 @@ def detail(r: CaseResult) -> dict:
     if sc is not None:
         d["scenario_info"] = {
             "name": sc.name, "system_prompt": sc.system_prompt, "user_message": sc.user_message,
-            "canary": sc.surface.canary, "attacker_url": sc.surface.attacker_url,
+            # the secret this case actually used, so the page highlights the right value
+            "canary": r.canary or sc.surface.canary, "attacker_url": sc.surface.attacker_url,
             "attacker_email": sc.surface.attacker_email,
         }
     return d
@@ -98,6 +105,8 @@ class Job:
     lock: threading.Lock = field(default_factory=threading.Lock)
     out_dir: Optional[str] = None
     message: Optional[str] = None
+    seed: str = ""
+    grader: Any = None
 
     def emit(self, kind: str, **data: Any) -> None:
         with self.lock:
@@ -145,6 +154,7 @@ class State:
             "techniques": [{"id": t.id, "description": t.description} for t in self.techniques.values()],
             "defenses": [{"id": d.id, "description": d.description} for d in DEFENSES.values()],
             "channels": list(CHANNELS),
+            "positions": list(POSITIONS),
             "max_runs": MAX_RUNS,
         }
 
@@ -156,7 +166,12 @@ class State:
             techniques=techs or None, channels=plan.get("channels") or None,
             include_clean=bool(plan.get("include_clean", True)),
             repeats=max(1, min(int(plan.get("repeats", 1)), 20)),
+            positions=plan.get("positions") or ["end"],
         )
+
+    def _techniques(self, plan: dict) -> dict:
+        chosen = plan.get("techniques") or self.techniques
+        return {k: v for k, v in self.techniques.items() if k in chosen}
 
     def estimate(self, plan: dict) -> dict:
         cases = self.cases(plan)
@@ -185,6 +200,10 @@ class State:
             if d not in DEFENSES:
                 raise ValueError(f"unknown defense {d}")
         cases = self.cases(plan)
+        max_turns = max(1, min(int(plan.get("max_turns", 12)), MAX_TURNS))
+        temperature = plan.get("temperature")
+        temperature = None if temperature in (None, "") else float(temperature)
+        seed = str(plan.get("seed") or "").strip() or secrets.token_hex(8)
         total = len(cases) * len(defenses) * len(targets)
         if total == 0:
             raise ValueError("the selection produces no test cases")
@@ -193,8 +212,16 @@ class State:
         agents = []
         for t in targets:
             agents.append(build_agent(t.provider, t.model, api_key=self.key_for(t.provider),
-                                      base_url=t.base_url, max_turns=int(plan.get("max_turns", 12)),
-                                      fallbacks=t.fallbacks, effort=t.effort))
+                                      base_url=t.base_url, max_turns=max_turns,
+                                      fallbacks=t.fallbacks, effort=t.effort, temperature=temperature))
+        grader = None
+        grader_spec = str(plan.get("grader") or "").strip()
+        if grader_spec:
+            from ..grader import make_grader
+            gp, _, gm = grader_spec.partition(":")
+            if gp not in PROVIDERS or not gm.strip():
+                raise ValueError("the LLM grader must look like provider:model, e.g. anthropic:claude-opus-5")
+            grader = make_grader(gp, gm.strip(), self.key_for(gp), self.base_urls.get(gp))
         with ThreadPoolExecutor(max_workers=8) as pool:
             checks = list(pool.map(lambda t: probe_model(t.provider, t.model, self.key_for(t.provider), t.base_url),
                                    targets))
@@ -203,7 +230,9 @@ class State:
             raise ValueError("Can't use " + "; ".join(bad))
         job = Job(id=uuid.uuid4().hex[:10], targets=targets, total=total,
                   plan={k: v for k, v in plan.items() if k != "targets"} | {
-                      "targets": [t.__dict__ for t in targets]})
+                      "targets": [t.__dict__ for t in targets], "seed": seed, "max_turns": max_turns,
+                      "temperature": temperature, "positions": plan.get("positions") or ["end"]},
+                  seed=seed, grader=grader)
         tasks = []
         for case in cases:
             for d in defenses:
@@ -213,10 +242,17 @@ class State:
                     job.order.append({"key": key, "target": ti, "defense": d, "case_id": case.id,
                                       "injected": case.injected})
         with self.lock:
+            self._prune_jobs()
             self.jobs[job.id] = job
         threading.Thread(target=self._run_job, args=(job, agents, tasks, int(plan.get("workers", 4))),
                          daemon=True).start()
         return job
+
+    def _prune_jobs(self) -> None:
+        finished = [j for j in self.jobs.values() if j.status in ("done", "cancelled", "failed")]
+        finished.sort(key=lambda j: j.finished or 0)
+        for j in finished[:max(0, len(finished) - KEEP_FINISHED_JOBS + 1)]:
+            del self.jobs[j.id]
 
     def _run_job(self, job: Job, agents: list, tasks: list, workers: int) -> None:
         job.status = "running"
@@ -240,7 +276,8 @@ class State:
                          is_error=call.is_error, payload_seen=seen_now)
 
             try:
-                res = run_case(agents[ti], case, DEFENSES[d](), listener=listener)
+                res = run_case(agents[ti], case, DEFENSES[d](), listener=listener, seed=job.seed,
+                               grader=job.grader)
             except Exception as exc:
                 job.emit("log", level="error", message=f"{case.id}: {exc}")
                 return
@@ -278,15 +315,17 @@ class State:
         with (out / "cases.jsonl").open("w", encoding="utf-8") as f:
             for r in ordered:
                 f.write(json.dumps(r.to_dict(), ensure_ascii=False, default=str) + "\n")
+        prov = provenance(self._techniques(job.plan), seed=job.seed, temperature=job.plan.get("temperature"),
+                          max_turns=job.plan.get("max_turns"), grader=job.plan.get("grader") or None)
         meta = {"job": job.id, "status": status, "started": stamp,
-                "targets": [t.__dict__ for t in job.targets], "plan": job.plan,
+                "targets": [t.__dict__ for t in job.targets], "plan": job.plan, "provenance": prov,
                 "keys": [t["key"] for t in job.order if t["key"] in job.results]}
         (out / "dashboard.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         for ti, t in enumerate(job.targets):
             rows = [job.results[o["key"]] for o in job.order
                     if o["target"] == ti and o["key"] in job.results]
             if rows:
-                write_outputs(out / _slug(t.label), rows, {"agent": t.label, "job": job.id})
+                write_outputs(out / _slug(t.label), rows, {"agent": t.label, "job": job.id, **prov})
         job.out_dir = str(out)
 
     def snapshot(self, job: Job, since: int) -> dict:
@@ -328,8 +367,8 @@ class State:
         d = (self.results_dir / name).resolve()
         if self.results_dir.resolve() not in d.parents:
             raise ValueError("invalid run name")
-        rows = [CaseResult(**json.loads(l)) for l in (d / "cases.jsonl").read_text(encoding="utf-8").splitlines()
-                if l.strip()]
+        rows = [_upgrade(CaseResult(**json.loads(l)))
+                for l in (d / "cases.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
         labels: list[str] = []
         lights = []
         for i, r in enumerate(rows):
@@ -340,9 +379,22 @@ class State:
         return targets, lights, rows
 
 
+def _upgrade(r: CaseResult) -> CaseResult:
+    """Older runs scored a failed request as "unexposed"; score it the way the judge does now."""
+    if r.injected and r.error and r.outcome == "unexposed":
+        r.outcome = "error"
+    return r
+
+
 def make_handler(state: State, token: str, allowed_hosts: set[str]):
     index_html = (STATIC / "index.html").read_text(encoding="utf-8")
-    run_cache: dict[str, list[CaseResult]] = {}
+    run_cache: OrderedDict[str, list[CaseResult]] = OrderedDict()
+
+    def cache_run(name: str, rows: list[CaseResult]) -> None:
+        run_cache[name] = rows
+        run_cache.move_to_end(name)
+        while len(run_cache) > RUN_CACHE_SIZE:
+            run_cache.popitem(last=False)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "injectbench"
@@ -406,7 +458,7 @@ def make_handler(state: State, token: str, allowed_hosts: set[str]):
                     return self._json(state.runs())
                 if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                     targets, lights, rows = state.load_run(parts[2])
-                    run_cache[parts[2]] = rows
+                    cache_run(parts[2], rows)
                     return self._json({"name": parts[2], "targets": targets, "records": lights})
                 if len(parts) == 5 and parts[:2] == ["api", "runs"] and parts[3] == "cases":
                     rows = run_cache.get(parts[2]) or state.load_run(parts[2])[2]
@@ -491,7 +543,12 @@ def make_handler(state: State, token: str, allowed_hosts: set[str]):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765, results_dir: str = "results",
-          techniques_file: Optional[str] = None, open_browser: bool = True) -> None:
+          techniques_file: Optional[str] = None, open_browser: bool = True, env_file: str = ".env") -> None:
+    from ..envfile import load_env_file
+
+    loaded = load_env_file(env_file)
+    if loaded:
+        print(f"Loaded {', '.join(loaded)} from {env_file}", flush=True)
     state = State(Path(results_dir), techniques_file)
     token = secrets.token_urlsafe(24)
     server = ThreadingHTTPServer((host, port), None)  # type: ignore[arg-type]

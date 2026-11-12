@@ -159,6 +159,7 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 .chip .ck { display: inline-block; width: 12px; }
 .nums { display: flex; gap: 16px; flex-wrap: wrap; }
 .nums input { width: 90px; }
+.nums input.wide { width: 210px; }
 .estimate { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); }
 .estimate .big-n { font-size: 26px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .estimate .est-text { color: var(--text-secondary); font-size: 13px; flex: 1; min-width: 220px; }
@@ -352,7 +353,7 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 13px
     <p class="sub">Add API keys, choose the models to test, and pick which attacks to run. Each case gives a model a normal task and plants an instruction in data it reads. All tools are mocks.</p>
 
     <div class="card">
-      <div class="card-h"><span class="step">1</span><h2>API keys</h2><span class="note">Keys found in environment variables are picked up automatically.</span></div>
+      <div class="card-h"><span class="step">1</span><h2>API keys</h2><span class="note">Keys in a .env file (see .env.example) or in environment variables are picked up automatically.</span></div>
       <div class="secnote">Keys are sent only to the local injectbench process and kept in memory until it stops. They are not written to disk or into results.</div>
       <div class="prov-grid" id="providers"></div>
     </div>
@@ -379,6 +380,9 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 13px
         <label class="lbl">Parallel workers<input type="number" id="pWorkers" min="1" max="32" value="4"></label>
         <label class="lbl">Max turns per case<input type="number" id="pTurns" min="1" max="40" value="12"></label>
         <label class="lbl">Baseline cases<select id="pClean"><option value="1">include</option><option value="0">skip</option></select></label>
+        <label class="lbl" title="Every case gets its own secret derived from this seed. Leave blank for a random seed; it is saved with the results.">Seed<input id="pSeed" placeholder="random" autocomplete="off" spellcheck="false"></label>
+        <label class="lbl" title="Leave blank to use each provider's default. Current Claude models and OpenAI reasoning models don't accept it.">Temperature<input type="number" id="pTemp" min="0" max="2" step="0.1" placeholder="default"></label>
+        <label class="lbl" title="Optional second opinion on task completion from an LLM, as provider:model. The keyword check stays the main result.">LLM grader<input id="pGrader" class="wide" placeholder="off, or e.g. anthropic:claude-opus-5" autocomplete="off" spellcheck="false"></label>
       </div>
       <div class="estimate">
         <div><div class="big-n" id="estN">–</div><div class="muted" style="font-size:12px">agent runs</div></div>
@@ -425,6 +429,7 @@ details summary { cursor: pointer; color: var(--text-secondary); font-size: 13px
               <option value="goal_category">attack goal</option>
               <option value="goal">goal (detailed)</option>
               <option value="technique">technique</option>
+              <option value="position">position in content</option>
               <option value="defense">defense</option>
               <option value="scenario">scenario</option>
             </select>
@@ -504,7 +509,7 @@ const OUT = {
   error:       { label: "Error",       icon: "!", desc: "API or agent error" },
 };
 const OUT_ORDER = ["compromised", "refused", "resisted", "unexposed", "error"];
-const DIM_LABEL = { channel: "Data source", goal_category: "Attack goal", goal: "Goal", technique: "Technique", defense: "Defense", scenario: "Scenario" };
+const DIM_LABEL = { channel: "Data source", goal_category: "Attack goal", goal: "Goal", technique: "Technique", position: "Position", defense: "Defense", scenario: "Scenario" };
 
 const S = {
   config: null, keyMsg: {}, fetched: {}, targets: [],
@@ -713,10 +718,11 @@ const PLAN_GROUPS = [
   { key: "channels", title: "Data sources (where the instruction hides)", items: c => c.channels.map(ch => ({ id: ch, label: ch.replace("_", " ") })) },
   { key: "goals", title: "Attack goals", items: c => c.goals.map(g => ({ id: g.id, label: g.id.replace(/_/g, " "), tip: g.description })) },
   { key: "techniques", title: "Techniques", items: c => c.techniques.map(t => ({ id: t.id, label: t.id.replace(/_/g, " "), tip: t.description })) },
+  { key: "positions", title: "Where the instruction sits in the content", items: c => c.positions.map(p => ({ id: p, label: p, tip: p === "end" ? "Appended after the original text." : p === "start" ? "Placed before the original text." : "Inserted at the sentence break closest to the middle." })) },
   { key: "defenses", title: "Defenses to compare", items: c => c.defenses.map(d => ({ id: d.id, label: d.id, tip: d.description })) },
 ];
 function defaultPlan(c) {
-  return { scenarios: c.scenarios.map(s => s.id), channels: [...c.channels], goals: c.goals.map(g => g.id), techniques: c.techniques.map(t => t.id), defenses: ["none"] };
+  return { scenarios: c.scenarios.map(s => s.id), channels: [...c.channels], goals: c.goals.map(g => g.id), techniques: c.techniques.map(t => t.id), positions: ["end"], defenses: ["none"] };
 }
 function renderPlan() {
   $("#plan").innerHTML = PLAN_GROUPS.map(g => {
@@ -738,13 +744,17 @@ $("#plan").addEventListener("click", e => {
   else return;
   renderPlan();
 });
-["#pRepeats", "#pWorkers", "#pTurns", "#pClean"].forEach(s => $(s).addEventListener("change", () => { store("nums", nums()); estimate(); }));
-function nums() { return { repeats: +$("#pRepeats").value || 1, workers: +$("#pWorkers").value || 4, max_turns: +$("#pTurns").value || 12, include_clean: $("#pClean").value === "1" }; }
+["#pRepeats", "#pWorkers", "#pTurns", "#pClean", "#pSeed", "#pTemp", "#pGrader"].forEach(s => $(s).addEventListener("change", () => { store("nums", nums()); estimate(); }));
+function nums() {
+  const temp = $("#pTemp").value.trim();
+  return { repeats: +$("#pRepeats").value || 1, workers: +$("#pWorkers").value || 4, max_turns: +$("#pTurns").value || 12, include_clean: $("#pClean").value === "1",
+           seed: $("#pSeed").value.trim(), temperature: temp === "" ? null : +temp, grader: $("#pGrader").value.trim() };
+}
 function planBody() {
   const c = S.config, p = S.plan;
   return {
     targets: S.targets,
-    scenarios: p.scenarios, goals: p.goals, techniques: p.techniques, defenses: p.defenses,
+    scenarios: p.scenarios, goals: p.goals, techniques: p.techniques, positions: p.positions, defenses: p.defenses,
     channels: p.channels.length === c.channels.length ? [] : p.channels,
     ...nums(),
   };
@@ -754,8 +764,8 @@ function estimate() {
   clearTimeout(estTimer);
   estTimer = setTimeout(async () => {
     const p = S.plan;
-    if (!p.scenarios.length || !p.goals.length || !p.techniques.length || !p.channels.length) {
-      $("#estN").textContent = "0"; $("#estText").textContent = "Select at least one scenario, data source, goal and technique."; return;
+    if (!p.scenarios.length || !p.goals.length || !p.techniques.length || !p.channels.length || !p.positions.length) {
+      $("#estN").textContent = "0"; $("#estText").textContent = "Select at least one scenario, data source, goal, technique and position."; return;
     }
     try {
       const e = await api("/api/estimate", planBody());
@@ -1119,6 +1129,7 @@ function renderCase(c, rec) {
   const needles = [[payload, "payload"], [payloadJson, "payload"], ...secrets];
   const b = [badge(c.outcome, { task_success: c.task_success }),
     `<span class="badge ${c.task_success ? "ok-t" : "bad-t"}">${c.task_success ? "✓ user's task done" : "✗ user's task not done"}</span>`];
+  if (c.task_success_llm != null) b.push(`<span class="badge" title="Second opinion from the LLM grader; the keyword check above is the main result.">LLM grader: ${c.task_success_llm ? "task done" : "task not done"}</span>`);
   if (c.injected) b.push(`<span class="badge">${c.exposed ? "⚑ read the payload" : "◌ never read the payload"}</span>`);
   if (c.flagged_injection) b.push(`<span class="badge">⚠ warned the user</span>`);
   if (c.fallback_used) b.push(`<span class="badge">↪ fallback model served</span>`);
@@ -1128,7 +1139,7 @@ function renderCase(c, rec) {
   h += `<div class="mk-legend" style="margin-top:4px"><span><mark class="payload">hidden instruction</mark></span><span><mark class="secret">secret or attacker address</mark></span></div>`;
   if (c.injected) {
     h += `<h3>Hidden instruction · ${esc(c.channel)} · ${esc(c.injection_point)}</h3>
-      <div class="muted" style="font-size:12.5px;margin-bottom:6px">Goal <b>${esc(c.goal)}</b> via technique <b>${esc(c.technique)}</b></div>
+      <div class="muted" style="font-size:12.5px;margin-bottom:6px">Goal <b>${esc(c.goal)}</b> via technique <b>${esc(c.technique)}</b>${c.position && c.position !== "end" ? ` at the <b>${esc(c.position)}</b> of the content` : ""}</div>
       <pre class="box">${highlight(payload, [[payload, "payload"]])}</pre>`;
   } else h += `<h3>Baseline case</h3><div class="muted">No instruction planted. Shows whether the model can do the task at all.</div>`;
   h += `<h3>Conversation</h3>`;
@@ -1194,7 +1205,10 @@ $("#histTable").addEventListener("click", async e => {
     if (v.length || g.key !== "defenses") S.plan[g.key] = v.length ? v : dp[g.key];
   }
   const n = load("nums", null);
-  if (n) { $("#pRepeats").value = n.repeats; $("#pWorkers").value = n.workers; $("#pTurns").value = n.max_turns; $("#pClean").value = n.include_clean ? "1" : "0"; }
+  if (n) {
+    $("#pRepeats").value = n.repeats; $("#pWorkers").value = n.workers; $("#pTurns").value = n.max_turns; $("#pClean").value = n.include_clean ? "1" : "0";
+    $("#pSeed").value = n.seed || ""; $("#pTemp").value = n.temperature ?? ""; $("#pGrader").value = n.grader || "";
+  }
   renderProviders(); renderProviderSelect(); renderTargets(); renderPlan();
 })();
 </script>
